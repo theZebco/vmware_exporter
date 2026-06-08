@@ -9,10 +9,13 @@ from __future__ import print_function
 
 # Generic imports
 import argparse
+import errno
 import os
 import re
+import socket
 import ssl
 import sys
+import time
 import traceback
 import pytz
 import logging
@@ -582,7 +585,44 @@ class VmwareCollector():
             return vmware_connect
 
         except vmodl.MethodFault as error:
-            logging.error("Caught vmodl fault: {error}".format(error=error.msg))
+            logging.error("Caught vmodl fault connecting to vcenter {host}: {error}".format(
+                host=self.host, error=error.msg))
+            return None
+
+        except ssl.SSLError as error:
+            # Certificate/TLS negotiation problems (set ignore_ssl or fix the cert)
+            logging.error("TLS/SSL error connecting to vcenter {host}: {error}".format(
+                host=self.host, error=error))
+            return None
+
+        except (socket.timeout, TimeoutError) as error:
+            logging.error("Timed out connecting to vcenter {host}: {error}".format(
+                host=self.host, error=error))
+            return None
+
+        except OSError as error:
+            # Socket-level failures. pyVmomi surfaces a TLS handshake that the peer
+            # aborts as 'OSError: [Errno 0] Error', and an unroutable target as
+            # 'OSError: [Errno 113] Host is unreachable'.
+            if error.errno == errno.EHOSTUNREACH:
+                logging.error("vcenter {host} is unreachable (no network route): {error}".format(
+                    host=self.host, error=error))
+            elif error.errno == errno.ECONNREFUSED:
+                logging.error("vcenter {host} refused the connection: {error}".format(
+                    host=self.host, error=error))
+            elif error.errno in (0, None):
+                logging.error("vcenter {host} closed the connection during TLS handshake: {error}".format(
+                    host=self.host, error=error))
+            else:
+                logging.error("Network error connecting to vcenter {host} (errno {num}): {error}".format(
+                    host=self.host, num=error.errno, error=error))
+            return None
+
+        except Exception as error:
+            # Last-resort guard so any other failure still logs cleanly instead of
+            # surfacing as a noisy "Unhandled error in Deferred".
+            logging.error("Error connecting to vcenter {host}: {error}".format(
+                host=self.host, error=error))
             return None
 
     @run_once_property
@@ -590,6 +630,10 @@ class VmwareCollector():
     def content(self):
         logging.info("Retrieving service instance content")
         connection = yield self.connection
+        if connection is None:
+            raise ConnectionError(
+                "Unable to connect to vcenter {host}, skipping collection".format(host=self.host)
+            )
         content = yield threads.deferToThread(
             connection.RetrieveContent
         )
@@ -1865,6 +1909,16 @@ class VMWareMetricsResource(Resource):
         Init Metric Resource
         """
         Resource.__init__(self)
+        # Upper bound (seconds) for a single /metrics scrape, so a slow or
+        # unreachable vCenter returns promptly instead of hanging.
+        self.collection_timeout = int(os.environ.get('VSPHERE_COLLECTION_TIMEOUT', 60))
+        # Internal cache: while a cache entry is fresher than this TTL we serve it
+        # directly without hitting vCenter. 0 disables caching.
+        self.cache_ttl = int(os.environ.get('VSPHERE_CACHE_TTL', 60))
+        # cache_key -> {'metrics': [...], 'fetched_at': epoch}
+        self._metrics_cache = {}
+        # cache_keys currently being refreshed, to avoid stampedes
+        self._inflight = set()
         self.configure(args)
 
     def configure(self, args):
@@ -1931,15 +1985,64 @@ class VMWareMetricsResource(Resource):
         self._async_render_GET(request)
         return NOT_DONE_YET
 
+    @staticmethod
+    def _request_active(request):
+        """ True if the client connection is still open and writable """
+        return not getattr(request, '_disconnected', False) and getattr(request, 'channel', None) is not None
+
+    def _safe_write(self, request, output):
+        """ write to the request only if the client is still connected """
+        if self._request_active(request):
+            request.write(output)
+
+    def _safe_finish(self, request):
+        """ finish the request only if the client is still connected, avoiding
+        'Request.finish called on a request after its connection was lost' """
+        if self._request_active(request):
+            request.finish()
+
+    @staticmethod
+    def _render_output(metrics, vsphere_host, up, fetched_at):
+        """ render the metric families plus exporter health/cache metrics """
+        up_metric = GaugeMetricFamily(
+            'vmware_up',
+            'Whether the most recent scrape of the vCenter/ESXi target succeeded (1) or failed (0)',
+            labels=['vsphere_host'])
+        up_metric.add_metric([vsphere_host], 1 if up else 0)
+
+        scrape_ts_metric = GaugeMetricFamily(
+            'vmware_last_scrape_timestamp_seconds',
+            'Unix timestamp of the data currently being served for the target',
+            labels=['vsphere_host'])
+        if fetched_at:
+            scrape_ts_metric.add_metric([vsphere_host], fetched_at)
+
+        registry = CollectorRegistry()
+        registry.register(ListCollector(list(metrics) + [up_metric, scrape_ts_metric]))
+        return generate_latest(registry)
+
+    def _respond_metrics(self, request, output):
+        """ send a 200 metrics response if the client is still connected """
+        if not self._request_active(request):
+            logging.info("Client disconnected before metrics could be sent")
+            return
+        request.setHeader("Content-Type", "text/plain; charset=UTF-8")
+        request.setResponseCode(200)
+        self._safe_write(request, output)
+        self._safe_finish(request)
+
     @defer.inlineCallbacks
     def _async_render_GET(self, request):
+        # generate_latest_metrics is expected to always respond (serving cached or
+        # vmware_up 0 metrics on failure). This is only a last-resort safety net.
         try:
             yield self.generate_latest_metrics(request)
         except Exception:
             logging.error(traceback.format_exc())
-            request.setResponseCode(500)
-            request.write(b'# Collection failed')
-            request.finish()
+            if self._request_active(request):
+                request.setResponseCode(500)
+                self._safe_write(request, b'# Collection failed')
+                self._safe_finish(request)
 
         # We used to call request.processingFailed to send a traceback to browser
         # This can make sense in debug mode for a HTML site - but we don't want
@@ -1953,8 +2056,10 @@ class VMWareMetricsResource(Resource):
             logging.info("{} is not a valid section, using default".format(section))
             section = 'default'
 
-        if self.config[section].get('vsphere_host') and self.config[section].get('vsphere_host') != "None":
-            vsphere_host = self.config[section].get('vsphere_host')
+        section_config = self.config[section]
+
+        if section_config.get('vsphere_host') and section_config.get('vsphere_host') != "None":
+            vsphere_host = section_config.get('vsphere_host')
         elif request.args.get(b'target', [None])[0]:
             vsphere_host = request.args.get(b'target', [None])[0].decode('utf-8')
         elif request.args.get(b'vsphere_host', [None])[0]:
@@ -1962,31 +2067,81 @@ class VMWareMetricsResource(Resource):
         else:
             request.setResponseCode(500)
             logging.info("No vsphere_host or target defined")
-            request.write(b'No vsphere_host or target defined!\n')
-            request.finish()
+            self._safe_write(request, b'No vsphere_host or target defined!\n')
+            self._safe_finish(request)
             return
 
-        collector = VmwareCollector(
-            vsphere_host,
-            self.config[section]['vsphere_user'],
-            self.config[section]['vsphere_password'],
-            self.config[section]['collect_only'],
-            self.config[section]['specs_size'],
-            self.config[section]['fetch_custom_attributes'],
-            self.config[section]['ignore_ssl'],
-            self.config[section]['fetch_tags'],
-            self.config[section]['fetch_alarms'],
-        )
-        metrics = yield collector.collect()
+        cache_key = (section, vsphere_host)
+        entry = self._metrics_cache.get(cache_key)
+        now = time.time()
 
-        registry = CollectorRegistry()
-        registry.register(ListCollector(metrics))
-        output = generate_latest(registry)
+        # 1) Fresh cache hit: serve immediately, no vCenter call.
+        if entry and self.cache_ttl > 0 and (now - entry['fetched_at']) < self.cache_ttl:
+            logging.info("Serving cached metrics for {host} (age {age:.0f}s)".format(
+                host=vsphere_host, age=now - entry['fetched_at']))
+            self._respond_metrics(
+                request,
+                self._render_output(entry['metrics'], vsphere_host, up=True, fetched_at=entry['fetched_at'])
+            )
+            return
 
-        request.setHeader("Content-Type", "text/plain; charset=UTF-8")
-        request.setResponseCode(200)
-        request.write(output)
-        request.finish()
+        # 2) Missing credentials: never fail the endpoint, expose vmware_up 0 (plus stale data if any).
+        if not section_config.get('vsphere_user') or not section_config.get('vsphere_password'):
+            logging.error("Section '{section}' is missing vsphere_user/vsphere_password".format(section=section))
+            stale = entry['metrics'] if entry else []
+            self._respond_metrics(
+                request,
+                self._render_output(stale, vsphere_host, up=False,
+                                    fetched_at=entry['fetched_at'] if entry else None)
+            )
+            return
+
+        # 3) A refresh is already running for this target: serve current cache to avoid stampedes.
+        if cache_key in self._inflight and entry:
+            logging.info("Refresh already in progress for {host}, serving cached metrics".format(host=vsphere_host))
+            self._respond_metrics(
+                request,
+                self._render_output(entry['metrics'], vsphere_host, up=True, fetched_at=entry['fetched_at'])
+            )
+            return
+
+        # 4) Refresh from vCenter, falling back to stale cache on any failure/timeout.
+        self._inflight.add(cache_key)
+        try:
+            collector = VmwareCollector(
+                vsphere_host,
+                section_config['vsphere_user'],
+                section_config['vsphere_password'],
+                section_config.get('collect_only'),
+                section_config.get('specs_size', 5000),
+                section_config.get('fetch_custom_attributes', False),
+                section_config.get('ignore_ssl', False),
+                section_config.get('fetch_tags', False),
+                section_config.get('fetch_alarms', False),
+            )
+            collection = collector.collect()
+            collection.addTimeout(self.collection_timeout, reactor)
+            metrics = yield collection
+
+            self._metrics_cache[cache_key] = {'metrics': metrics, 'fetched_at': time.time()}
+            output = self._render_output(metrics, vsphere_host, up=True,
+                                         fetched_at=self._metrics_cache[cache_key]['fetched_at'])
+            logging.info("Collected fresh metrics for {host}".format(host=vsphere_host))
+
+        except Exception:
+            logging.error("Failed to collect metrics from {host}:\n{tb}".format(
+                host=vsphere_host, tb=traceback.format_exc()))
+            if entry:
+                logging.info("Serving STALE cached metrics for {host} (age {age:.0f}s)".format(
+                    host=vsphere_host, age=time.time() - entry['fetched_at']))
+                output = self._render_output(entry['metrics'], vsphere_host, up=False,
+                                             fetched_at=entry['fetched_at'])
+            else:
+                output = self._render_output([], vsphere_host, up=False, fetched_at=None)
+        finally:
+            self._inflight.discard(cache_key)
+
+        self._respond_metrics(request, output)
 
 
 class HealthzResource(Resource):
@@ -2049,6 +2204,11 @@ def main(argv=None):
     if not isinstance(numeric_level, int):
         raise ValueError("Invalid log level: {level}".format(level=args.loglevel))
     logging.basicConfig(level=numeric_level, format='%(asctime)s %(levelname)s:%(message)s')
+
+    # Bound blocking socket operations (e.g. pyVmomi SmartConnect / SOAP calls) so an
+    # unreachable or unresponsive vCenter fails fast instead of hanging the scrape.
+    socket_timeout = int(os.environ.get('VSPHERE_SOCKET_TIMEOUT', 30))
+    socket.setdefaulttimeout(socket_timeout)
 
     reactor.suggestThreadPoolSize(25)
 

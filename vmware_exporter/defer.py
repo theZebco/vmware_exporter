@@ -7,6 +7,13 @@ from twisted.internet import defer
 from twisted.python import failure
 
 
+_NO_RESULT = object()
+
+
+def _passthrough(result):
+    return result
+
+
 class BranchingDeferred(defer.Deferred):
 
     '''
@@ -37,37 +44,67 @@ class BranchingDeferred(defer.Deferred):
     vm_inventory to run in parallel).
 
     Unfortunately you can't have parallel branches blocking on the same deferred
-    like this with a standard Twisted deferred.
+    like this with a standard Twisted deferred: a normal Deferred has a single
+    linear callback chain and can only be consumed once.
 
-    This is a deferred that enables the parallel branching use case.
+    This is a "broadcast" deferred: every consumer that adds callbacks (or yields
+    it from an inlineCallbacks coroutine) gets its own private Deferred that is
+    fired with the shared result. It works across Twisted versions because all of
+    the add* entry points (which newer Twisted routes through addBoth, bypassing
+    addCallbacks) are overridden to register an independent waiter.
     '''
 
     def __init__(self):
-        self.callbacks = []
-        self.result = None
+        super().__init__()
+        # (value, is_failure) once fired, otherwise the _NO_RESULT sentinel.
+        self._branch_result = _NO_RESULT
+        self._branch_waiters = []
+
+    def _register(self, waiter):
+        if self._branch_result is _NO_RESULT:
+            self._branch_waiters.append(waiter)
+        else:
+            value, is_failure = self._branch_result
+            (waiter.errback if is_failure else waiter.callback)(value)
+        return waiter
+
+    def addCallbacks(self, callback, errback=None,
+                     callbackArgs=(), callbackKeywords={},
+                     errbackArgs=(), errbackKeywords={}):
+        waiter = defer.Deferred()
+        waiter.addCallbacks(
+            callback, errback,
+            callbackArgs=callbackArgs, callbackKeywords=callbackKeywords,
+            errbackArgs=errbackArgs, errbackKeywords=errbackKeywords,
+        )
+        return self._register(waiter)
+
+    def addCallback(self, callback, *args, **kwargs):
+        return self.addCallbacks(callback, callbackArgs=args, callbackKeywords=kwargs)
+
+    def addErrback(self, errback, *args, **kwargs):
+        return self.addCallbacks(_passthrough, errback, errbackArgs=args, errbackKeywords=kwargs)
+
+    def addBoth(self, callback, *args, **kwargs):
+        return self.addCallbacks(
+            callback, callback,
+            callbackArgs=args, callbackKeywords=kwargs,
+            errbackArgs=args, errbackKeywords=kwargs,
+        )
 
     def callback(self, result):
-        self.result = result
-        while self.callbacks:
-            self.callbacks.pop(0).callback(result)
+        self._branch_fire(result, False)
 
-    def errback(self, err):
-        self.result = err
-        while self.callbacks:
-            self.callbacks.pop(0).errback(err)
+    def errback(self, fail=None):
+        if not isinstance(fail, failure.Failure):
+            fail = failure.Failure(fail)
+        self._branch_fire(fail, True)
 
-    def addCallbacks(self, *args, **kwargs):
-        if self.result is None:
-            d = defer.Deferred()
-            d.addCallbacks(*args, **kwargs)
-            self.callbacks.append(d)
-            return
-
-        if isinstance(self.result, failure.Failure):
-            defer.fail(self.result).addCallbacks(*args, **kwargs)
-            return
-
-        defer.succeed(self.result).addCallbacks(*args, **kwargs)
+    def _branch_fire(self, value, is_failure):
+        self._branch_result = (value, is_failure)
+        waiters, self._branch_waiters = self._branch_waiters, []
+        for waiter in waiters:
+            (waiter.errback if is_failure else waiter.callback)(value)
 
 
 class run_once_property(object):
